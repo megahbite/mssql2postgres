@@ -1,0 +1,10 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    tiny_tds (0.6.1)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  tiny_tds
