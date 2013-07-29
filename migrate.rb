@@ -1,5 +1,68 @@
 require 'tiny_tds'
 require 'yaml'
+require 'pg'
+
+def map_types(type_name, length, scale, precision, is_identity)
+  case type_name
+  #Numeric types
+  when "bigint"
+    return is_identity ? "bigserial" : "bigint"
+  when "bit"
+    return "boolean"
+  when "decimal", "numeric"
+    return "numeric(#{precision}, #{scale})"
+  when "int"
+    return is_identity ? "serial" : "integer"
+  when "money", "smallmoney"
+    return "numeric(12, 2)"
+  when "smallint"
+    return is_identity ? "smallserial" : "smallint"
+  when "tinyint"
+    return "smallint"
+  when "float"
+    if precision == 15
+      return "double precision"
+    else
+      return "real"
+    end
+  when "real"
+    return "real"
+
+  #Dates/Times
+  when "date"
+    return "date"
+  when "datetime"
+    return "timestamp" 
+  when "datetime2"
+    return "timestamp(#{precision})"
+  when "datetimeoffset"
+    return "timestamp(#{precision}) with time zone"
+  when "time"
+    return "time(#{precision})"
+
+  #Character types
+  when "char", "nchar"
+    return "character(#{length})"
+  when "varchar", "nvarchar"
+    if length == -1
+      return "character varying"
+    else
+      return "character varying(#{length})"
+    end
+  when "text", "ntext"
+    return "text"
+  when "binary", "varbinary", "image"
+    return "bytea"
+
+  #Other
+  when "uniqueidentifier"
+    return "uuid"
+  when "xml"
+    return "xml"
+  else
+    return "character varying"
+  end
+end
 
 credentials_file = File.new('db_creds', 'r')
 
@@ -62,6 +125,42 @@ tables.each do |table|
   end
 end
 
-yaml_file = File.new('table_schema.yaml', 'w')
-yaml_file.write(tables.to_yaml())
-yaml_file.close
+dest_credentials_file = File.new('dest_db_creds', 'r')
+
+if not dest_credentials_file
+  raise "No destination credentials file"
+end
+
+username = dest_credentials_file.readline.strip
+password = dest_credentials_file.readline.strip
+host = dest_credentials_file.readline.strip
+database = dest_credentials_file.readline.strip
+
+dest_credentials_file.close
+
+dest_db_client = PG::connect(host: host, dbname: database, user: username, password: password)
+
+#Create tables on postgres
+tables.each do |table|
+  dest_db_client.exec("DROP TABLE IF EXISTS #{table[:name]}")
+
+  create_sql = "CREATE TABLE #{table[:name]} ("
+
+  table[:columns].each do |column|
+    create_sql += "#{column[:name]} #{map_types(column[:type], column[:max_length], column[:scale], 
+      column[:precision], column[:is_identity])} "
+    
+    create_sql += "NOT NULL " unless column[:is_nullable]
+
+    create_sql += ", "
+  end
+
+  keys = table[:columns].select { |c| c[:is_primary_key] }.map { |c| c[:name] }
+
+  create_sql += "CONSTRAINT #{table[:name]}_#{keys.join('_')}_key PRIMARY KEY(#{keys.join(',')})" if keys.length > 0
+
+  create_sql.chomp!(" , ")
+  create_sql += ")"
+
+  dest_db_client.exec(create_sql)
+end
