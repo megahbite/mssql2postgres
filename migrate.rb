@@ -63,7 +63,7 @@ def map_types(type_name, length, scale, precision, is_identity)
   when "xml"
     return "xml"
   else
-    return "character varying"
+    raise "Unrecognised or unsupported MSSQL type #{type_name}"
   end
 end
 
@@ -132,20 +132,21 @@ def read_credentials(file_handle)
   }
 end
 
+def symbolize_keys(hash)
+  hash.keys.each do |key|
+    hash[(key.to_sym rescue key) || key] = hash.delete(key)
+  end
+end
+
 # tables to ignore
 blacklist = YAML.load_file('blacklist.yml')
 
-credentials_file = File.new('db_creds', 'r')
 
-if not credentials_file
-  raise "No credentials file"
-end
+creds = YAML.load_file('db_creds.yml')
+symbolize_keys(creds)
+creds.merge!({timeout: 0})
 
-creds = read_credentials(credentials_file)
-
-credentials_file.close
-
-mssql_conn = TinyTds::Client.new(username: creds[:username], password: creds[:password], host: creds[:host], database: creds[:database], timeout: 0)
+mssql_conn = TinyTds::Client.new(creds)
 
 tables = []
 
@@ -179,17 +180,10 @@ tables.each do |table|
   end
 end
 
-dest_credentials_file = File.new('dest_db_creds', 'r')
+creds = YAML.load_file("dest_db_creds.yml")
+symbolize_keys(creds)
 
-if not dest_credentials_file
-  raise "No destination credentials file"
-end
-
-creds = read_credentials(dest_credentials_file)
-
-dest_credentials_file.close
-
-pg_conn = PG::connect(host: creds[:host], dbname: creds[:database], user: creds[:username], password: creds[:password])
+pg_conn = PG::connect(creds)
 
 #Create tables on postgres
 tables.each do |table|

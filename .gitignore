@@ -1,4 +1,3 @@
 .DS_Store
-db_creds
-dest_db_creds
-table_schema.yaml
+db_creds.yml
+dest_db_creds.yml
