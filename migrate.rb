@@ -1,6 +1,9 @@
 require 'tiny_tds'
 require 'yaml'
 require 'pg'
+require 'csv'
+
+PAGE_SIZE = 5000
 
 def map_types(type_name, length, scale, precision, is_identity)
   case type_name
@@ -64,37 +67,47 @@ def map_types(type_name, length, scale, precision, is_identity)
   end
 end
 
-credentials_file = File.new('db_creds', 'r')
+def next_page(db, table_name, field_list, order_column, page, page_size)
+  select_sql = "WITH foo AS (SELECT #{field_list}, ROW_NUMBER() OVER(ORDER BY #{order_column}) as row_num FROM #{table_name}) 
+  SELECT #{field_list} FROM foo WHERE row_num BETWEEN #{(page - 1) * page_size - 1} AND #{page * page_size}" 
 
-if not credentials_file
-  raise "No credentials file"
+  db.execute(select_sql)
 end
 
-username = credentials_file.readline.strip
-password = credentials_file.readline.strip
-host = credentials_file.readline.strip
-database = credentials_file.readline.strip
+def copy_data_to(db, table, columns, from)
+  db.exec("COPY #{table} (#{columns.map { |c| c[:name] }.join(", ")}) FROM STDIN WITH CSV")
+  begin
+    from.each(cache_rows: false) do |row|
+      row.keys.each do |k|
+        unless columns.select { |c| c[:name] == k and ["binary", "varbinary", "image"].include?(c[:type]) }.empty?
+          row[k] = db.escape_bytea(row[k]) unless row[k] == nil
+        end
 
-credentials_file.close
+        unless columns.select { |c| c[:name] == k and ["char", "nchar", "varchar", "nvarchar", "text", "ntext"].include?(c[:type]) }.empty?
+          row[k] = db.escape_string(row[k]) unless row[k] == nil
+        end
+      end
+      buf = row.values.to_csv
 
-db_client = TinyTds::Client.new(username: username, password: password, host: host, database: database)
-
-tables = []
-
-puts ">> Fetching tables"
-#Gather info on tables
-db_client.execute('SELECT * FROM sys.tables ORDER BY name').each do |row|
-  tables << { name: row["name"], object_id: row["object_id"] }
+      until db.put_copy_data(buf)
+        sleep 0.1
+      end
+    end
+  rescue Errno => err
+    errmsg = "%s while reading copy data: %s" % [ err.class.name, err.message ]
+    db.put_copy_end( errmsg )
+  else
+    db.put_copy_end
+    while res = db.get_result
+      puts "Result of COPY is: %s" % [ res.res_status(res.result_status) ]
+    end
+  end
 end
 
-puts "#{tables.length} tables fetched"
-
-
-#Get column info
-tables.each do |table|
-  puts ">> Fetching columns for #{table[:name]}"
+def get_column_metadata(db, object_id)
   columns = []
-  db_client.execute("SELECT column_id as id, name, TYPE_NAME(user_type_id) as type, max_length, is_identity, is_nullable, scale, precision FROM sys.columns WHERE object_id = #{table[:object_id]} ORDER BY column_id").each do |row|
+  db.execute("SELECT column_id as id, name, TYPE_NAME(user_type_id) as type, max_length, is_identity, is_nullable, scale, precision 
+    FROM sys.columns WHERE object_id = #{object_id} ORDER BY column_id").each do |row|
     columns << { 
       id: row["id"],
       name: row["name"], 
@@ -107,14 +120,55 @@ tables.each do |table|
       is_primary_key: false
     }
   end
-  table.merge!({columns: columns})
-  puts "#{columns.length} columns fetched"
+  columns
+end
+
+def read_credentials(file_handle)
+  {
+    username: file_handle.readline.strip,
+    password: file_handle.readline.strip,
+    host: file_handle.readline.strip,
+    database: file_handle.readline.strip
+  }
+end
+
+# tables to ignore
+blacklist = YAML.load_file('blacklist.yml')
+
+credentials_file = File.new('db_creds', 'r')
+
+if not credentials_file
+  raise "No credentials file"
+end
+
+creds = read_credentials(credentials_file)
+
+credentials_file.close
+
+mssql_conn = TinyTds::Client.new(username: creds[:username], password: creds[:password], host: creds[:host], database: creds[:database], timeout: 0)
+
+tables = []
+
+puts ">> Fetching tables"
+#Gather info on tables
+mssql_conn.execute('SELECT * FROM sys.tables ORDER BY name').each do |row|
+  tables << { name: row["name"], object_id: row["object_id"] } unless blacklist.include?(row["name"])
+end
+
+puts "#{tables.length} tables fetched"
+
+
+#Get column info
+tables.each do |table|
+  puts ">> Fetching columns for #{table[:name]}"
+  table.merge!({columns: get_column_metadata(mssql_conn, table[:object_id])})
+  puts "#{table[:columns].length} columns fetched"
 end
 
 #Get primary key info
 tables.each do |table|
   puts ">> Fetching primary keys for #{table[:name]}"
-  db_client.execute("SELECT ic.column_id FROM 
+  mssql_conn.execute("SELECT ic.column_id FROM 
     sys.indexes AS i 
     INNER JOIN sys.index_columns AS ic ON 
     i.object_id = ic.object_id AND i.index_id = ic.index_id 
@@ -131,18 +185,15 @@ if not dest_credentials_file
   raise "No destination credentials file"
 end
 
-username = dest_credentials_file.readline.strip
-password = dest_credentials_file.readline.strip
-host = dest_credentials_file.readline.strip
-database = dest_credentials_file.readline.strip
+creds = read_credentials(dest_credentials_file)
 
 dest_credentials_file.close
 
-dest_db_client = PG::connect(host: host, dbname: database, user: username, password: password)
+pg_conn = PG::connect(host: creds[:host], dbname: creds[:database], user: creds[:username], password: creds[:password])
 
 #Create tables on postgres
 tables.each do |table|
-  dest_db_client.exec("DROP TABLE IF EXISTS #{table[:name]}")
+  pg_conn.exec("DROP TABLE IF EXISTS #{table[:name]}")
 
   create_sql = "CREATE TABLE #{table[:name]} ("
 
@@ -162,5 +213,28 @@ tables.each do |table|
   create_sql.chomp!(" , ")
   create_sql += ")"
 
-  dest_db_client.exec(create_sql)
+  pg_conn.exec(create_sql)
 end
+
+#Pull data and push to postgres
+tables.each do |table|
+  field_list = table[:columns].map { |c| "[" + c[:name] + "]" }.join(", ")
+  
+  page = 1
+
+  result = next_page(mssql_conn, table[:name], field_list, table[:columns].first[:name], page, PAGE_SIZE)
+
+  while result.count > 0
+    pg_conn.transaction do
+      puts "COPYing data to #{table[:name]}, page #{page}"
+      copy_data_to(pg_conn, table[:name], table[:columns], result)
+    end
+
+    page += 1
+
+    result = next_page(mssql_conn, table[:name], field_list, table[:columns].first[:name], page, PAGE_SIZE)
+  end
+end
+
+mssql_conn.close
+pg_conn.close
